@@ -1,0 +1,51 @@
+# === 敏感配置 & 密钥 ===
+.env
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+credentials.*
+
+# === Python ===
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# === 测试 & 缓存 ===
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# === IDE & 编辑器 ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# === 日志 & 数据库 ===
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# === AI / Agent 本地配置 ===
+.agents/
+.codex/
+
+# === 蓝牙/串口临时文件 ===
+*.pid
+*.lock
+

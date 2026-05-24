@@ -1,0 +1,4 @@
+dashscope>=1.25.0
+PyAudio>=0.2.14
+pyserial>=3.5
+python-dotenv>=1.2.0

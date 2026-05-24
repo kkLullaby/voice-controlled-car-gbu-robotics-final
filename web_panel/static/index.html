@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>语音小车控制台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="console-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">PC Voice Controller</p>
+        <h1>语音小车控制台</h1>
+      </div>
+      <div class="status-strip">
+        <span id="dryRunPill" class="pill warn">Dry Run</span>
+        <span id="asrPill" class="pill">ASR Idle</span>
+        <span id="btPill" class="pill">/dev/rfcomm0</span>
+      </div>
+    </header>
+
+    <section class="layout">
+      <section class="control-surface">
+        <div class="voice-dial">
+          <button id="browserMicBtn" class="mic-button" type="button" aria-label="浏览器语音">
+            <span class="mic-mark"></span>
+          </button>
+          <div class="dial-readout">
+            <span>浏览器语音</span>
+            <strong id="browserSpeechStatus">待机</strong>
+          </div>
+        </div>
+
+        <div class="text-entry">
+          <label for="manualText">中文命令</label>
+          <div class="input-row">
+            <input id="manualText" type="text" autocomplete="off" placeholder="前进 / 停止 / 左转">
+            <button id="sendTextBtn" type="button">发送</button>
+          </div>
+        </div>
+
+        <div class="command-grid" aria-label="直接动作码">
+          <button data-code="F" type="button"><span>F</span>前进</button>
+          <button data-code="B" type="button"><span>B</span>后退</button>
+          <button data-code="L" type="button"><span>L</span>左转</button>
+          <button data-code="R" type="button"><span>R</span>右转</button>
+          <button data-code="S" class="danger" type="button"><span>S</span>停止</button>
+          <button data-code="U" type="button"><span>U</span>加速</button>
+          <button data-code="D" type="button"><span>D</span>减速</button>
+        </div>
+      </section>
+
+      <aside class="telemetry">
+        <div class="readout">
+          <span>最后识别</span>
+          <strong id="lastText">-</strong>
+        </div>
+        <div class="readout">
+          <span>最后动作</span>
+          <strong id="lastCommand">-</strong>
+        </div>
+
+        <div class="config-panel">
+          <label class="switch-row">
+            <input id="dryRunInput" type="checkbox" checked>
+            <span>Dry Run</span>
+          </label>
+          <label>
+            蓝牙端口
+            <input id="btPortInput" type="text" value="/dev/rfcomm0">
+          </label>
+          <label>
+            波特率
+            <input id="btBaudInput" type="number" value="9600" min="1200" step="300">
+          </label>
+          <button id="saveConfigBtn" class="secondary" type="button">应用配置</button>
+        </div>
+
+        <div class="asr-controls">
+          <button id="startAsrBtn" type="button">启动 DashScope</button>
+          <button id="stopAsrBtn" class="secondary" type="button">停止</button>
+        </div>
+      </aside>
+    </section>
+
+    <section class="event-band">
+      <div class="event-head">
+        <h2>运行日志</h2>
+        <span id="keyStatus">Key: -</span>
+      </div>
+      <ol id="eventLog" class="event-log"></ol>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
+
