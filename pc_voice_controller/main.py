@@ -8,7 +8,14 @@ import sys
 from typing import Iterable
 
 from .asr_listener import DashScopeMicListener
-from .bluetooth_sender import BluetoothConfig, BluetoothSender, DryRunBluetoothSender
+from .bluetooth_sender import (
+    BluetoothConfig,
+    BluetoothSender,
+    DryRunBluetoothSender,
+    MultiBluetoothSender,
+    SendTargetResult,
+    parse_bluetooth_ports,
+)
 from .command_parser import CommandDebouncer, CommandParser, ParsedCommand
 
 
@@ -22,7 +29,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="manual-text",
         help="manual-code sends typed F/B/L/R/S/U/D; manual-text parses typed Chinese; asr uses mic.",
     )
-    parser.add_argument("--port", default=os.getenv("BT_PORT", "/dev/rfcomm0"))
+    default_ports = os.getenv("BT_PORTS") or os.getenv("BT_PORT", "/dev/rfcomm0")
+    parser.add_argument(
+        "--ports",
+        default=default_ports,
+        help="comma-separated Bluetooth serial ports, e.g. /dev/rfcomm0,/dev/rfcomm1",
+    )
+    parser.add_argument("--port", dest="ports", help=argparse.SUPPRESS)
     parser.add_argument("--baud", type=int, default=int(os.getenv("BT_BAUD", "9600")))
     parser.add_argument("--dry-run", action="store_true", help="print commands without Bluetooth")
     parser.add_argument(
@@ -40,11 +53,8 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = CommandParser()
     debouncer = CommandDebouncer(args.repeat_interval)
-    sender = (
-        DryRunBluetoothSender()
-        if args.dry_run
-        else BluetoothSender(BluetoothConfig(port=args.port, baudrate=args.baud))
-    )
+    ports = parse_bluetooth_ports(args.ports)
+    sender = build_sender(ports, args.baud, args.dry_run)
 
     try:
         if args.mode == "manual-code":
@@ -64,6 +74,14 @@ def main(argv: list[str] | None = None) -> int:
         sender.close()
 
     return 0
+
+
+def build_sender(ports: tuple[str, ...], baudrate: int, dry_run: bool):
+    if dry_run:
+        return DryRunBluetoothSender(ports)
+    if len(ports) == 1:
+        return BluetoothSender(BluetoothConfig(port=ports[0], baudrate=baudrate))
+    return MultiBluetoothSender.from_ports(ports, baudrate=baudrate)
 
 
 def load_env_file_if_available() -> None:
@@ -89,11 +107,14 @@ def read_stdin_lines() -> Iterable[str]:
 def run_manual_code(sender) -> None:
     print("Type command codes F/B/L/R/S/U/D, one per line. Ctrl+C to exit.")
     while True:
-        code = input("> ").strip().upper()
+        try:
+            code = input("> ").strip().upper()
+        except EOFError:
+            return
         if not code:
             continue
-        sender.send_command(code)
-        print(f"[send] {code}")
+        results = sender.send_command(code)
+        print(f"[send] {code} {format_send_results(results)}")
 
 
 def run_text_stream(
@@ -112,8 +133,8 @@ def run_text_stream(
             print(f"[skip-repeat] {format_command(command)}")
             continue
 
-        sender.send_command(command.code)
-        print(f"[send] {format_command(command)}")
+        results = sender.send_command(command.code)
+        print(f"[send] {format_command(command)} {format_send_results(results)}")
 
 
 def format_command(command: ParsedCommand) -> str:
@@ -121,6 +142,16 @@ def format_command(command: ParsedCommand) -> str:
         f"{command.source_text} -> {command.code} "
         f"({command.label}, matched={command.matched_phrase})"
     )
+
+
+def format_send_results(results: list[SendTargetResult]) -> str:
+    parts = []
+    for result in results:
+        if result.ok:
+            parts.append(f"{result.port}:ok")
+        else:
+            parts.append(f"{result.port}:error={result.error}")
+    return "[" + ", ".join(parts) + "]"
 
 
 if __name__ == "__main__":

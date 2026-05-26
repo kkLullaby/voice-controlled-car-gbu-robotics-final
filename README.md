@@ -41,11 +41,11 @@ cp .env.example .env
 
 ```text
 DASHSCOPE_API_KEY=你的 DashScope Key
-BT_PORT=/dev/rfcomm0
+BT_PORTS=/dev/rfcomm0,/dev/rfcomm1
 BT_BAUD=9600
 ```
 
-Linux 上经典蓝牙串口常见设备名是 `/dev/rfcomm0`。实际设备可以用 `ls /dev/rfcomm* /dev/ttyUSB* /dev/ttyACM*` 检查。
+Linux 上经典蓝牙串口常见设备名是 `/dev/rfcomm0`、`/dev/rfcomm1`。实际设备可以用 `ls /dev/rfcomm* /dev/ttyUSB* /dev/ttyACM*` 检查。
 
 ## Run
 
@@ -64,7 +64,7 @@ http://127.0.0.1:8765
 默认是 dry-run，不会碰真实蓝牙。要真实发送蓝牙：
 
 ```bash
-python -m web_panel.server --host 127.0.0.1 --port 8765 --real-bluetooth --bt-port /dev/rfcomm0
+python -m web_panel.server --host 127.0.0.1 --port 8765 --real-bluetooth --bt-ports /dev/rfcomm0,/dev/rfcomm1
 ```
 
 先用 dry-run 验证中文解析，不连接蓝牙：
@@ -84,13 +84,13 @@ python -m pc_voice_controller.main --mode manual-text --dry-run
 连接蓝牙后，手动发送动作码：
 
 ```bash
-python -m pc_voice_controller.main --mode manual-code --port /dev/rfcomm0
+python -m pc_voice_controller.main --mode manual-code --ports /dev/rfcomm0,/dev/rfcomm1
 ```
 
 接入语音识别：
 
 ```bash
-python -m pc_voice_controller.main --mode asr --port /dev/rfcomm0
+python -m pc_voice_controller.main --mode asr --ports /dev/rfcomm0,/dev/rfcomm1
 ```
 
 ## Development Checks

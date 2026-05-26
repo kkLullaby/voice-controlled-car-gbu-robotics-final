@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Iterable, Protocol
 
 from .command_parser import VALID_COMMANDS
 
@@ -25,6 +25,17 @@ class BluetoothConfig:
     port: str
     baudrate: int = 9600
     timeout: float = 1.0
+    close_after_send: bool = True
+
+
+@dataclass(frozen=True)
+class SendTargetResult:
+    """Result of sending one command to one Bluetooth target."""
+
+    port: str
+    ok: bool
+    error: str | None = None
+    dry_run: bool = False
 
 
 class BluetoothSender:
@@ -52,18 +63,26 @@ class BluetoothSender:
             timeout=self.config.timeout,
         )
 
-    def send_command(self, code: str) -> None:
+    def send_command(self, code: str) -> list[SendTargetResult]:
         command = code.strip().upper()
         if command not in VALID_COMMANDS:
             raise ValueError(f"Unsupported command code: {code!r}")
 
-        if self._serial is None:
-            self.open()
-        if self._serial is None:
-            raise RuntimeError("Bluetooth serial is not open")
+        try:
+            if self._serial is None:
+                self.open()
+            if self._serial is None:
+                raise RuntimeError("Bluetooth serial is not open")
 
-        self._serial.write(f"{command}\n".encode("ascii"))
-        self._serial.flush()
+            self._serial.write(f"{command}\n".encode("ascii"))
+            self._serial.flush()
+            return [SendTargetResult(port=self.config.port, ok=True)]
+        except Exception as exc:
+            self.close()
+            return [SendTargetResult(port=self.config.port, ok=False, error=str(exc))]
+        finally:
+            if self.config.close_after_send:
+                self.close()
 
     def close(self) -> None:
         if self._serial is not None and self._owns_serial:
@@ -81,12 +100,79 @@ class BluetoothSender:
 class DryRunBluetoothSender:
     """Drop-in sender that prints commands without touching Bluetooth hardware."""
 
-    def send_command(self, code: str) -> None:
+    def __init__(self, ports: Iterable[str] | None = None):
+        self.ports = tuple(ports or ("dry-run",))
+
+    def send_command(self, code: str) -> list[SendTargetResult]:
         command = code.strip().upper()
         if command not in VALID_COMMANDS:
             raise ValueError(f"Unsupported command code: {code!r}")
-        print(f"[dry-run] would send: {command}")
+        results = []
+        for port in self.ports:
+            print(f"[dry-run] {port} <- {command}")
+            results.append(SendTargetResult(port=port, ok=True, dry_run=True))
+        return results
 
     def close(self) -> None:
         return None
 
+
+class MultiBluetoothSender:
+    """Broadcast one command to multiple Bluetooth serial ports."""
+
+    def __init__(self, senders: Iterable[BluetoothSender]):
+        self.senders = tuple(senders)
+        if not self.senders:
+            raise ValueError("At least one Bluetooth sender is required")
+
+    @classmethod
+    def from_ports(
+        cls,
+        ports: Iterable[str],
+        *,
+        baudrate: int = 9600,
+        timeout: float = 1.0,
+    ) -> "MultiBluetoothSender":
+        senders = [
+            BluetoothSender(BluetoothConfig(port=port, baudrate=baudrate, timeout=timeout))
+            for port in ports
+        ]
+        return cls(senders)
+
+    def send_command(self, code: str) -> list[SendTargetResult]:
+        command = code.strip().upper()
+        if command not in VALID_COMMANDS:
+            raise ValueError(f"Unsupported command code: {code!r}")
+
+        results: list[SendTargetResult] = []
+        for sender in self.senders:
+            try:
+                results.extend(sender.send_command(command))
+            except Exception as exc:
+                results.append(
+                    SendTargetResult(
+                        port=sender.config.port,
+                        ok=False,
+                        error=str(exc),
+                    )
+                )
+        return results
+
+    def close(self) -> None:
+        for sender in self.senders:
+            sender.close()
+
+
+def parse_bluetooth_ports(value: str | Iterable[str] | None) -> tuple[str, ...]:
+    """Parse comma-separated Bluetooth ports into a stable tuple."""
+
+    if value is None:
+        return ("/dev/rfcomm0",)
+    if isinstance(value, str):
+        ports = [part.strip() for part in value.split(",")]
+    else:
+        ports = [str(part).strip() for part in value]
+    cleaned = tuple(port for port in ports if port)
+    if not cleaned:
+        raise ValueError("At least one Bluetooth port is required")
+    return cleaned

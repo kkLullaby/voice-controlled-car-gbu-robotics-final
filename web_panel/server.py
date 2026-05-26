@@ -15,7 +15,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 from pc_voice_controller.asr_listener import DashScopeMicListener
-from pc_voice_controller.bluetooth_sender import BluetoothConfig, BluetoothSender, DryRunBluetoothSender
+from pc_voice_controller.bluetooth_sender import (
+    DryRunBluetoothSender,
+    MultiBluetoothSender,
+    SendTargetResult,
+    parse_bluetooth_ports,
+)
 from pc_voice_controller.command_parser import CommandDebouncer, CommandParser, ParsedCommand, VALID_COMMANDS
 from pc_voice_controller.main import load_env_file_if_available
 
@@ -27,7 +32,7 @@ STATIC_ROOT = Path(__file__).resolve().parent / "static"
 @dataclass
 class PanelConfig:
     dry_run: bool = True
-    port: str = "/dev/rfcomm0"
+    ports: tuple[str, ...] = ("/dev/rfcomm0", "/dev/rfcomm1")
     baudrate: int = 9600
     repeat_interval_seconds: float = 1.0
 
@@ -44,6 +49,7 @@ class PanelState:
         self.sender = self._new_sender()
         self.last_text = ""
         self.last_command: str | None = None
+        self.last_send_results: list[dict[str, Any]] = []
         self.asr_running = False
         self.asr_stop_event: threading.Event | None = None
         self.asr_thread: threading.Thread | None = None
@@ -51,21 +57,24 @@ class PanelState:
 
     def _new_sender(self):
         if self.config.dry_run:
-            return DryRunBluetoothSender()
-        return BluetoothSender(
-            BluetoothConfig(port=self.config.port, baudrate=self.config.baudrate)
+            return DryRunBluetoothSender(self.config.ports)
+        return MultiBluetoothSender.from_ports(
+            self.config.ports,
+            baudrate=self.config.baudrate,
         )
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             return {
                 "dry_run": self.config.dry_run,
-                "port": self.config.port,
+                "ports": list(self.config.ports),
+                "port": ",".join(self.config.ports),
                 "baudrate": self.config.baudrate,
                 "repeat_interval_seconds": self.config.repeat_interval_seconds,
                 "asr_running": self.asr_running,
                 "last_text": self.last_text,
                 "last_command": self.last_command,
+                "last_send_results": self.last_send_results,
                 "events": list(self.events),
                 "dashscope_key_present": bool(os.getenv("DASHSCOPE_API_KEY", "").strip()),
             }
@@ -73,9 +82,10 @@ class PanelState:
     def update_config(self, data: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
             self.sender.close()
+            port_value = data.get("ports", data.get("port", ",".join(self.config.ports)))
             self.config = PanelConfig(
                 dry_run=bool(data.get("dry_run", self.config.dry_run)),
-                port=str(data.get("port", self.config.port)).strip() or "/dev/rfcomm0",
+                ports=parse_bluetooth_ports(port_value),
                 baudrate=int(data.get("baudrate", self.config.baudrate)),
                 repeat_interval_seconds=float(
                     data.get("repeat_interval_seconds", self.config.repeat_interval_seconds)
@@ -85,7 +95,11 @@ class PanelState:
             self.sender = self._new_sender()
             self.add_event(
                 "config",
-                f"dry_run={self.config.dry_run} port={self.config.port} baud={self.config.baudrate}",
+                "dry_run={} ports={} baud={}".format(
+                    self.config.dry_run,
+                    ",".join(self.config.ports),
+                    self.config.baudrate,
+                ),
             )
             return self.snapshot()
 
@@ -114,23 +128,28 @@ class PanelState:
         if command not in VALID_COMMANDS:
             raise ValueError(f"Unsupported command code: {code!r}")
 
-        self.sender.send_command(command)
+        results = self.sender.send_command(command)
+        serialized = serialize_send_results(results)
         with self.lock:
             self.last_command = command
-        self.add_event("send", f"{source}: {command}")
-        return {"sent": True, "command": command}
+            self.last_send_results = serialized
+        self.add_event("send", f"{source}: {command} {format_send_results(results)}")
+        return {"sent": any(result.ok for result in results), "command": command, "results": serialized}
 
     def send_parsed_command(self, command: ParsedCommand, source: str = "panel") -> dict[str, Any]:
-        self.sender.send_command(command.code)
+        results = self.sender.send_command(command.code)
+        serialized = serialize_send_results(results)
         with self.lock:
             self.last_command = command.code
-        self.add_event("send", f"{source}: {format_command(command)}")
+            self.last_send_results = serialized
+        self.add_event("send", f"{source}: {format_command(command)} {format_send_results(results)}")
         return {
-            "sent": True,
+            "sent": any(result.ok for result in results),
             "text": command.source_text,
             "command": command.code,
             "label": command.label,
             "matched_phrase": command.matched_phrase,
+            "results": serialized,
         }
 
     def start_asr(self) -> dict[str, Any]:
@@ -272,11 +291,35 @@ def format_command(command: ParsedCommand) -> str:
     )
 
 
+def serialize_send_results(results: list[SendTargetResult]) -> list[dict[str, Any]]:
+    return [
+        {
+            "port": result.port,
+            "ok": result.ok,
+            "error": result.error,
+            "dry_run": result.dry_run,
+        }
+        for result in results
+    ]
+
+
+def format_send_results(results: list[SendTargetResult]) -> str:
+    parts = []
+    for result in results:
+        if result.ok:
+            parts.append(f"{result.port}:ok")
+        else:
+            parts.append(f"{result.port}:error={result.error}")
+    return "[" + ", ".join(parts) + "]"
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the local voice control web panel.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--bt-port", default=os.getenv("BT_PORT", "/dev/rfcomm0"))
+    default_ports = os.getenv("BT_PORTS") or os.getenv("BT_PORT", "/dev/rfcomm0,/dev/rfcomm1")
+    parser.add_argument("--bt-ports", default=default_ports)
+    parser.add_argument("--bt-port", dest="bt_ports", help=argparse.SUPPRESS)
     parser.add_argument("--bt-baud", type=int, default=int(os.getenv("BT_BAUD", "9600")))
     parser.add_argument("--dry-run", action="store_true", default=True)
     parser.add_argument("--real-bluetooth", action="store_false", dest="dry_run")
@@ -286,7 +329,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> int:
     load_env_file_if_available()
     args = build_arg_parser().parse_args()
-    config = PanelConfig(dry_run=args.dry_run, port=args.bt_port, baudrate=args.bt_baud)
+    config = PanelConfig(
+        dry_run=args.dry_run,
+        ports=parse_bluetooth_ports(args.bt_ports),
+        baudrate=args.bt_baud,
+    )
     state = PanelState(config)
 
     handler_class = type(
@@ -296,7 +343,13 @@ def main() -> int:
     )
     server = ThreadingHTTPServer((args.host, args.port), handler_class)
     print(f"Web panel running at http://{args.host}:{args.port}")
-    print(f"dry_run={config.dry_run} bt_port={config.port} bt_baud={config.baudrate}")
+    print(
+        "dry_run={} bt_ports={} bt_baud={}".format(
+            config.dry_run,
+            ",".join(config.ports),
+            config.baudrate,
+        )
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

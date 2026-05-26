@@ -45,18 +45,28 @@ async function refreshStatus() {
 }
 
 function renderStatus(data) {
+  const ports = Array.isArray(data.ports) ? data.ports : String(data.port || "").split(",");
+  const portText = ports.filter(Boolean).join(",");
   els.dryRunInput.checked = Boolean(data.dry_run);
-  els.btPortInput.value = data.port || "/dev/rfcomm0";
+  els.btPortInput.value = portText || "/dev/rfcomm0,/dev/rfcomm1";
   els.btBaudInput.value = String(data.baudrate || 9600);
   els.dryRunPill.textContent = data.dry_run ? "Dry Run" : "Bluetooth";
   els.dryRunPill.className = data.dry_run ? "pill warn" : "pill ok";
   els.asrPill.textContent = data.asr_running ? "ASR Running" : "ASR Idle";
   els.asrPill.className = data.asr_running ? "pill ok" : "pill";
-  els.btPill.textContent = data.port || "-";
+  els.btPill.textContent = ports.length > 1 ? `${ports.length} ports` : (portText || "-");
   els.lastText.textContent = data.last_text || "-";
-  els.lastCommand.textContent = data.last_command || "-";
+  els.lastCommand.textContent = formatLastCommand(data.last_command, data.last_send_results || []);
   els.keyStatus.textContent = data.dashscope_key_present ? "Key: present" : "Key: missing";
   renderEvents(data.events || []);
+}
+
+function formatLastCommand(command, results) {
+  if (!command) return "-";
+  const resultText = results
+    .map(result => `${result.port}:${result.ok ? "ok" : "err"}`)
+    .join(" ");
+  return resultText ? `${command} · ${resultText}` : command;
 }
 
 function renderEvents(events) {
@@ -113,7 +123,7 @@ async function saveConfig() {
     method: "POST",
     body: JSON.stringify({
       dry_run: els.dryRunInput.checked,
-      port: els.btPortInput.value,
+      ports: els.btPortInput.value,
       baudrate: Number(els.btBaudInput.value || 9600),
     }),
   });

@@ -26,11 +26,18 @@ U\n  加速
 D\n  减速
 ```
 
+方案 A 使用前后两块 Arduino 板：电脑同时向两个蓝牙串口广播同一条动作码。
+
+```text
+/dev/rfcomm0 -> 蓝牙 A -> 前轮 Arduino
+/dev/rfcomm1 -> 蓝牙 B -> 后轮 Arduino
+```
+
 ## First Version Decisions
 
 - 语音识别复用参考项目的 DashScope `paraformer-realtime-v2` 流式 ASR。
 - 命令解析使用关键词规则，不使用 LLM，降低延迟和不确定性。
-- 蓝牙按 Linux 串口设备处理，默认端口为 `/dev/rfcomm0`，波特率 `9600`。
+- 蓝牙按 Linux 串口设备处理，默认端口为 `/dev/rfcomm0,/dev/rfcomm1`，波特率 `9600`。
 - 对流式 ASR 重复文本做防抖：默认 1 秒内不重复发送同一动作码。
 - 未识别到 7 个动作之一时不发送任何蓝牙指令。
 
@@ -50,4 +57,8 @@ D\n  减速
 python -m web_panel.server --host 127.0.0.1 --port 8765
 ```
 
-面板复用同一套解析和发送模块，默认 dry-run。浏览器语音按钮使用浏览器自带中文语音识别，DashScope 按钮使用后端麦克风 ASR。
+面板复用同一套解析和发送模块，默认 dry-run。浏览器语音按钮使用浏览器自带中文语音识别，DashScope 按钮使用后端麦克风 ASR。真实双蓝牙发送时使用：
+
+```bash
+python -m web_panel.server --host 127.0.0.1 --port 8765 --real-bluetooth --bt-ports /dev/rfcomm0,/dev/rfcomm1
+```
