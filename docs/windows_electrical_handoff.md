@@ -1,5 +1,10 @@
 # Windows 电控开发交接指南
 
+> **更新（2026-06）**：PC 端（Linux）已经完成所有联调，包括双板真实蓝牙广播、浏览器语音整链路。Arduino 端的接收和电机控制 sketch 也已经写好并实测过 PC 端字节到位（`Examples/car_bluetooth_drive.ino`）。**剩下只是真车装电机+装电池+落地测试**。
+>
+> 如果你在 Windows 上操作，看这份文档。如果在 Linux 上操作，看 [motor_debug_handoff.md](motor_debug_handoff.md)（更详细，覆盖了本项目实测踩过的所有坑）。
+> 整车 bring-up 流程看 [hardware_bringup.md](hardware_bringup.md)。
+
 这份文档给负责 Arduino / 电控 / 小车端的同学使用。电脑端已经实现语音识别、中文命令解析和蓝牙串口发送；电控端需要保证两块 Arduino 能稳定接收并执行动作码。
 
 ## 1. 项目分工
@@ -145,7 +150,23 @@ S
 
 测试顺序一定先发 `S`，确认停车命令能收到。
 
-## 5. Arduino 接收逻辑建议
+## 5. Arduino 接收逻辑（**已经实现**）
+
+电控端的接收+电机控制 sketch 已经写好：`Examples/car_bluetooth_drive.ino`。它已经包含：
+
+- F/B/L/R/S/U/D 七个命令处理
+- 三档速度（U/D 切换）
+- 1 秒超时自动停车
+- 非法字符忽略
+- HC-04 接**硬件 Serial pin 0/1**（注意定制板的特殊接法，不是 SoftwareSerial）
+
+直接在 Arduino IDE 打开烧到两块板上即可。烧之前注意把 PC 端的 `rfcomm_keepalive`（Linux）或对应的串口监视器关掉，HC-04 在 RX0 上有时会干扰 bootloader 同步。
+
+如果你想理解 sketch 的实现细节或者改电机方向，看 [motor_debug_handoff.md](motor_debug_handoff.md) §3-§5。
+
+## 5.5. Arduino 接收逻辑（最小参考实现）
+
+如果你要自己另写 sketch 或调试，下面是协议层最小参考：
 
 电控端每块板的逻辑应该是：
 
@@ -231,23 +252,26 @@ D -> 两块板都减速一档
 
 ## 8. 已知电脑端实现细节
 
-电脑端使用 Python `pyserial` 写串口。由于 HC-04 实测长连接第二次写入可能报：
+电脑端使用 Python `pyserial` 写串口。
+
+**Linux 实测后采用长连接策略**（`close_after_send=False`，2026-06 改动）：
 
 ```text
-write failed: [Errno 5] Input/output error
-```
+程序启动时：
+  open COM 口（保持开着）
 
-所以当前发送器采用短连接策略：
-
-```text
 每条命令：
-  open COM 口
   write "F\n"
   flush
-  close COM 口
+
+write 失败时才 close + 下次自动重新 open。
 ```
 
-这对电控端无影响，Arduino 只会看到正常串口字符。
+早期版本因为传言"HC-04 长连接第二次写入 Input/output error"而用了短连接，但 Linux 实测的真实坑相反——短连接每次都重做 RFCOMM/SPP 握手，HC-04 字节根本来不及发出去。
+
+Windows 上 COM 口由系统蓝牙栈维持，长/短连接行为差异不像 Linux 那么明显。如果你在 Windows 上测发现"PC 端报 ok 但 Arduino 没收到"，可以试改回短连接（`BluetoothConfig(close_after_send=True)`），但目前没在 Windows 上观察到这个问题。
+
+对电控端无影响，Arduino 只会看到正常串口字符。
 
 ## 9. 联调验收标准
 

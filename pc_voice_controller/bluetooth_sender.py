@@ -20,12 +20,24 @@ class SerialLike(Protocol):
 
 @dataclass(frozen=True)
 class BluetoothConfig:
-    """Runtime configuration for a paired Bluetooth serial device."""
+    """Runtime configuration for a paired Bluetooth serial device.
+
+    `close_after_send=False` (the default) keeps the serial port open between
+    commands. This is required for HC-04 on Linux: every `open()` triggers a
+    fresh RFCOMM/SPP handshake (~300-800ms), and a `close()` immediately after
+    the first write often kicks the channel down before the byte makes it to
+    the Arduino. A long-lived connection works reliably as long as something
+    (e.g. `sudo rfcomm connect 0 <MAC> 1`) is holding the SPP link.
+
+    Set `close_after_send=True` only for fixtures/tests that want each
+    `send_command` to leave no open file handle.
+    """
 
     port: str
     baudrate: int = 9600
     timeout: float = 1.0
-    close_after_send: bool = True
+    close_after_send: bool = False
+    post_open_delay_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -62,6 +74,14 @@ class BluetoothSender:
             baudrate=self.config.baudrate,
             timeout=self.config.timeout,
         )
+        # Some serial-over-Bluetooth stacks (HC-04 in particular) drop the
+        # very first bytes if we write immediately after open(). A small
+        # opt-in delay lets the SPP channel settle. Default 0 keeps tests fast
+        # and matches the case where a `rfcomm connect` daemon already holds
+        # the link before the sender opens its tty.
+        if self.config.post_open_delay_seconds > 0:
+            import time
+            time.sleep(self.config.post_open_delay_seconds)
 
     def send_command(self, code: str) -> list[SendTargetResult]:
         command = code.strip().upper()
