@@ -1,9 +1,21 @@
 /*
   Rear UNO controller for the articulated four-wheel voice car.
 
-  This sketch is open-loop: it computes target wheel linear speeds from
-  geometry, then maps those speeds to PWM by a calibration table.
-  Fill the physical parameters and the speed-to-PWM table after the car is built.
+  Same open-loop kinematics as the front board. The one rear-specific bit:
+  PATH_OFFSET_M = VEHICLE_LENGTH_M, and only L/R go through a delay queue,
+  so the rear module begins its turn `VEHICLE_LENGTH_M / speed` seconds
+  after the front module — mimicking how a trailing axle follows a pulled
+  front axle along the same path.
+
+  2026-06 update (kept in sync with front_uno_controller):
+    - MotionState (STATIONARY/MOVING): in STATIONARY only F/B/S take effect,
+      L/R/U/D are silently ignored.
+    - F/B/U/D/S bypass the delay queue and execute immediately, so the
+      front and rear boards start/stop/change-speed in sync. ONLY L/R use
+      the rear path-offset delay.
+    - L/R auto-recenter after TURN_HOLD_TIME_S.
+    - F<->B reversal inserts a brief stop to protect the H-bridge.
+    - COMMAND_TIMEOUT_MS raised to 20s for sustained-motion testing.
 */
 
 #include <Arduino.h>
@@ -45,6 +57,11 @@ const float ENTER_TURN_TIME_S = 1.200f;
 // Smooth transition time for exiting a turn.
 // Unit: second (s)
 const float EXIT_TURN_TIME_S = 1.200f;
+
+// How long L/R holds the target curvature after the entry transition
+// finishes, before auto-recentering back to straight.
+// Unit: second (s)
+const float TURN_HOLD_TIME_S = 1.500f;
 
 // Minimum inner-wheel speed ratio allowed during a turn.
 // Example: 0.60 means the inner wheel should not go below 60% of the outer wheel.
@@ -145,8 +162,14 @@ const int RIGHT_REVERSE_PWM_PIN = 9;
 const unsigned long CONTROL_PERIOD_MS = 20;
 
 // Stop the car if no valid Bluetooth command is received in this time.
+// Raised from 3s to 20s for sustained-motion testing.
 // Unit: millisecond (ms)
-const unsigned long COMMAND_TIMEOUT_MS = 3000;
+const unsigned long COMMAND_TIMEOUT_MS = 20000;
+
+// Brief motor-off pause inserted when reversing F<->B, to protect the
+// H-bridge from a hard direction flip while current is still flowing.
+// Unit: millisecond (ms)
+const unsigned long DIRECTION_REVERSAL_PAUSE_MS = 100;
 
 // =======================
 // Runtime state
@@ -157,7 +180,15 @@ enum DriveState {
   DRIVE_ACTIVE,
 };
 
+// High-level motion state. STATIONARY = car not moving (boot, or after S).
+// In STATIONARY only F/B/S are accepted; L/R/U/D are silently ignored.
+enum MotionState {
+  MOTION_STATIONARY,
+  MOTION_MOVING,
+};
+
 DriveState driveState = DRIVE_STOPPED;
+MotionState motionState = MOTION_STATIONARY;
 int speedLevelIndex = DEFAULT_SPEED_LEVEL_INDEX;
 int driveDirection = 1;
 
@@ -169,12 +200,23 @@ unsigned long maneuverStartMs = 0;
 unsigned long lastCommandMs = 0;
 unsigned long lastControlMs = 0;
 
+// When the current turn should auto-recenter to straight (relative to the
+// rear board's local time, i.e. already delayed by pathDelayMs). 0 means
+// "no pending auto-recenter".
+unsigned long turnRecenterAtMs = 0;
+
 const int SPEED_LEVEL_COUNT = sizeof(SPEED_LEVELS_MPS) / sizeof(SPEED_LEVELS_MPS[0]);
 const int SPEED_TABLE_COUNT = sizeof(SPEED_TABLE_MPS) / sizeof(SPEED_TABLE_MPS[0]);
 
 // =======================
-// Command queue
+// Command queue (rear-only delay path for L/R)
 // =======================
+
+// Only L and R commands are queued here. F/B/U/D/S are executed
+// immediately to keep front and rear in sync on starts/stops/speed
+// changes. The queue's only job is to push L/R execution back by
+// pathDelayMs so the rear module begins its turn after the front
+// module has rolled forward by VEHICLE_LENGTH_M.
 
 struct QueuedCommand {
   char code;
@@ -210,6 +252,15 @@ void loop() {
   processQueue();
 
   const unsigned long now = millis();
+
+  // Auto-recenter when a previous L/R has held long enough.
+  if (motionState == MOTION_MOVING
+      && turnRecenterAtMs != 0
+      && (long)(now - turnRecenterAtMs) >= 0) {
+    turnRecenterAtMs = 0;
+    beginCurvatureManeuver(0.0f);
+  }
+
   if (driveState == DRIVE_ACTIVE && now - lastCommandMs > COMMAND_TIMEOUT_MS) {
     emergencyStop();
   }
@@ -229,13 +280,31 @@ void readBluetoothCommands() {
     if (command >= 'a' && command <= 'z') {
       command = command - 'a' + 'A';
     }
+
+    // STATIONARY filter: only F/B/S can do anything. L/R/U/D silently
+    // dropped (no queueing either — otherwise a turn queued while
+    // stopped would fire pathDelayMs after the next F).
+    if (motionState == MOTION_STATIONARY
+        && command != 'F' && command != 'B' && command != 'S') {
+      continue;
+    }
+
     lastCommandMs = millis();
-    if (command == 'S') {
-      queueCount = 0;
-      queueHead = 0;
-      emergencyStop();
-    } else {
+
+    if (command == 'L' || command == 'R') {
+      // Only L/R go through the rear delay queue.
       enqueue(command, millis());
+    } else {
+      // F/B/U/D/S execute immediately. On F/B the front and rear boards
+      // must start at the same instant; on U/D both must change speed
+      // together; on S both must stop together. We also drop any
+      // pending queued turn — a hard direction/state change invalidates
+      // older queued turns.
+      if (command == 'F' || command == 'B' || command == 'S') {
+        queueCount = 0;
+        queueHead = 0;
+      }
+      handleCommand(command);
     }
   }
 }
@@ -276,27 +345,19 @@ void handleCommand(char command) {
   switch (command) {
     case 'F':
       lastCommandMs = millis();
-      driveDirection = 1;
-      driveState = DRIVE_ACTIVE;
-      beginCurvatureManeuver(0.0f);
+      startOrUpdateDrive(+1);
       break;
     case 'B':
       lastCommandMs = millis();
-      driveDirection = -1;
-      driveState = DRIVE_ACTIVE;
-      beginCurvatureManeuver(0.0f);
+      startOrUpdateDrive(-1);
       break;
     case 'L':
       lastCommandMs = millis();
-      driveDirection = 1;
-      driveState = DRIVE_ACTIVE;
-      beginCurvatureManeuver(turnCurvature(+1));
+      beginTurn(+1);
       break;
     case 'R':
       lastCommandMs = millis();
-      driveDirection = 1;
-      driveState = DRIVE_ACTIVE;
-      beginCurvatureManeuver(turnCurvature(-1));
+      beginTurn(-1);
       break;
     case 'S':
       lastCommandMs = millis();
@@ -315,6 +376,29 @@ void handleCommand(char command) {
   }
 }
 
+void startOrUpdateDrive(int newDirection) {
+  if (motionState == MOTION_MOVING && newDirection != driveDirection) {
+    stopMotors();
+    delay(DIRECTION_REVERSAL_PAUSE_MS);
+  }
+  driveDirection = newDirection;
+  driveState = DRIVE_ACTIVE;
+  motionState = MOTION_MOVING;
+  turnRecenterAtMs = 0;
+  beginCurvatureManeuver(0.0f);
+}
+
+void beginTurn(int turnDirection) {
+  beginCurvatureManeuver(turnCurvature(turnDirection));
+  unsigned long holdMs =
+      (unsigned long)(ENTER_TURN_TIME_S * 1000.0f)
+    + (unsigned long)(TURN_HOLD_TIME_S * 1000.0f);
+  turnRecenterAtMs = millis() + holdMs;
+  if (turnRecenterAtMs == 0) {
+    turnRecenterAtMs = 1;
+  }
+}
+
 void beginCurvatureManeuver(float targetCurvature) {
   const unsigned long now = millis();
   maneuverStartCurvature = plannedCurvatureAt(now);
@@ -328,6 +412,10 @@ float plannedCurvatureAt(unsigned long nowMs) {
     return maneuverTargetCurvature;
   }
 
+  // No pathDelaySeconds() subtraction here, unlike the front board: the
+  // rear-board delay has already been applied by processQueue() before
+  // beginCurvatureManeuver was even called. Subtracting again would
+  // double-count it.
   const float elapsedS = (nowMs - maneuverStartMs) / 1000.0f;
 
   if (elapsedS <= 0.0f) {
@@ -516,10 +604,14 @@ int speedToPwm(float speedMps) {
 
 void emergencyStop() {
   driveState = DRIVE_STOPPED;
+  motionState = MOTION_STATIONARY;
   maneuverStartCurvature = 0.0f;
   maneuverTargetCurvature = 0.0f;
   maneuverTransitionTimeS = 0.0f;
   maneuverStartMs = millis();
+  turnRecenterAtMs = 0;
+  queueCount = 0;
+  queueHead = 0;
   stopMotors();
 }
 

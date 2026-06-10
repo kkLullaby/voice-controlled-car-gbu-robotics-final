@@ -4,6 +4,20 @@
   This sketch is open-loop: it computes target wheel linear speeds from
   geometry, then maps those speeds to PWM by a calibration table.
   Fill the physical parameters and the speed-to-PWM table after the car is built.
+
+  2026-06 update:
+    - MotionState (STATIONARY/MOVING): in STATIONARY only F/B/S take effect,
+      L/R/U/D are silently ignored.
+    - On F/B, BOTH front and rear boards must start at the same time; that
+      means F/B never go through the rear delay queue. Same for U/D and S.
+      Only L/R use the rear-board path delay.
+    - L/R auto-recenter after TURN_HOLD_TIME_S so a single turn command no
+      longer locks the car in a circle: it turns for a bit, then continues
+      driving straight.
+    - F<->B reversal inserts a brief stop to protect the H-bridge.
+    - COMMAND_TIMEOUT_MS raised to 20s for sustained-motion testing. WARNING:
+      a Bluetooth dropout now lets the car run ~20s before auto-stop. Keep
+      the emergency-stop window or battery switch within reach.
 */
 
 #include <Arduino.h>
@@ -45,6 +59,13 @@ const float ENTER_TURN_TIME_S = 1.200f;
 // Smooth transition time for exiting a turn.
 // Unit: second (s)
 const float EXIT_TURN_TIME_S = 1.200f;
+
+// How long L/R holds the target curvature after the entry transition
+// finishes, before auto-recentering back to straight. A single L/R command
+// therefore produces: enter turn (ENTER_TURN_TIME_S) -> hold turn
+// (TURN_HOLD_TIME_S) -> exit turn (EXIT_TURN_TIME_S) -> continue straight.
+// Unit: second (s)
+const float TURN_HOLD_TIME_S = 1.500f;
 
 // Minimum inner-wheel speed ratio allowed during a turn.
 // Example: 0.60 means the inner wheel should not go below 60% of the outer wheel.
@@ -103,13 +124,13 @@ const int PWM_MAX_SAFE = 170;
 
 // Per-wheel open-loop correction multipliers.
 // Unit: none
-const float LEFT_WHEEL_TRIM = 1.000f;
+const float LEFT_WHEEL_TRIM = 1.200f;
 const float RIGHT_WHEEL_TRIM = 1.000f;
 
 // Motor direction correction.
 // Use 1 for normal direction and -1 if the wheel runs backward.
 // Unit: none
-const int LEFT_MOTOR_DIR = 1;
+const int LEFT_MOTOR_DIR = -1;
 const int RIGHT_MOTOR_DIR = 1;
 
 // =======================
@@ -145,8 +166,14 @@ const int RIGHT_REVERSE_PWM_PIN = 9;
 const unsigned long CONTROL_PERIOD_MS = 20;
 
 // Stop the car if no valid Bluetooth command is received in this time.
+// Raised from 3s to 20s for sustained-motion testing.
 // Unit: millisecond (ms)
-const unsigned long COMMAND_TIMEOUT_MS = 3000;
+const unsigned long COMMAND_TIMEOUT_MS = 20000;
+
+// Brief motor-off pause inserted when reversing F<->B, to protect the
+// H-bridge from a hard direction flip while current is still flowing.
+// Unit: millisecond (ms)
+const unsigned long DIRECTION_REVERSAL_PAUSE_MS = 100;
 
 // =======================
 // Runtime state
@@ -157,7 +184,17 @@ enum DriveState {
   DRIVE_ACTIVE,
 };
 
+// High-level motion state. STATIONARY = car not moving (boot, or after S).
+// In STATIONARY only F/B/S are accepted; L/R/U/D are silently ignored,
+// because turning or changing speed while stopped is meaningless and would
+// also break the front/rear synchronized start.
+enum MotionState {
+  MOTION_STATIONARY,
+  MOTION_MOVING,
+};
+
 DriveState driveState = DRIVE_STOPPED;
+MotionState motionState = MOTION_STATIONARY;
 int speedLevelIndex = DEFAULT_SPEED_LEVEL_INDEX;
 int driveDirection = 1;
 
@@ -168,6 +205,10 @@ float maneuverTransitionTimeS = 0.0f;
 unsigned long maneuverStartMs = 0;
 unsigned long lastCommandMs = 0;
 unsigned long lastControlMs = 0;
+
+// When the current turn (non-zero target curvature) should auto-recenter to
+// straight. 0 means "no pending auto-recenter".
+unsigned long turnRecenterAtMs = 0;
 
 const int SPEED_LEVEL_COUNT = sizeof(SPEED_LEVELS_MPS) / sizeof(SPEED_LEVELS_MPS[0]);
 const int SPEED_TABLE_COUNT = sizeof(SPEED_TABLE_MPS) / sizeof(SPEED_TABLE_MPS[0]);
@@ -192,6 +233,16 @@ void loop() {
   readBluetoothCommands();
 
   const unsigned long now = millis();
+
+  // Auto-recenter: a previously-issued L/R has held its target curvature
+  // long enough; transition back to straight and clear the latch.
+  if (motionState == MOTION_MOVING
+      && turnRecenterAtMs != 0
+      && (long)(now - turnRecenterAtMs) >= 0) {
+    turnRecenterAtMs = 0;
+    beginCurvatureManeuver(0.0f);
+  }
+
   if (driveState == DRIVE_ACTIVE && now - lastCommandMs > COMMAND_TIMEOUT_MS) {
     emergencyStop();
   }
@@ -216,30 +267,31 @@ void readBluetoothCommands() {
 }
 
 void handleCommand(char command) {
+  // In STATIONARY, only F/B (start moving) and S (stay stopped) take effect.
+  // L/R/U/D are silently ignored so the car never starts moving from a turn
+  // or speed-change command, and so the rear board doesn't queue a turn
+  // before the front board has even begun rolling.
+  if (motionState == MOTION_STATIONARY
+      && command != 'F' && command != 'B' && command != 'S') {
+    return;
+  }
+
   switch (command) {
     case 'F':
       lastCommandMs = millis();
-      driveDirection = 1;
-      driveState = DRIVE_ACTIVE;
-      beginCurvatureManeuver(0.0f);
+      startOrUpdateDrive(+1);
       break;
     case 'B':
       lastCommandMs = millis();
-      driveDirection = -1;
-      driveState = DRIVE_ACTIVE;
-      beginCurvatureManeuver(0.0f);
+      startOrUpdateDrive(-1);
       break;
     case 'L':
       lastCommandMs = millis();
-      driveDirection = 1;
-      driveState = DRIVE_ACTIVE;
-      beginCurvatureManeuver(turnCurvature(+1));
+      beginTurn(+1);
       break;
     case 'R':
       lastCommandMs = millis();
-      driveDirection = 1;
-      driveState = DRIVE_ACTIVE;
-      beginCurvatureManeuver(turnCurvature(-1));
+      beginTurn(-1);
       break;
     case 'S':
       lastCommandMs = millis();
@@ -255,6 +307,40 @@ void handleCommand(char command) {
       break;
     default:
       break;
+  }
+}
+
+void startOrUpdateDrive(int newDirection) {
+  // F<->B reversal protection: if we're already moving in the opposite
+  // direction, stop the motors for a short pause before flipping. This
+  // prevents the H-bridge from seeing a hard polarity flip while current
+  // is still flowing through the motor windings.
+  if (motionState == MOTION_MOVING && newDirection != driveDirection) {
+    stopMotors();
+    delay(DIRECTION_REVERSAL_PAUSE_MS);
+  }
+  driveDirection = newDirection;
+  driveState = DRIVE_ACTIVE;
+  motionState = MOTION_MOVING;
+  // Starting (or re-asserting) straight motion cancels any pending turn.
+  turnRecenterAtMs = 0;
+  beginCurvatureManeuver(0.0f);
+}
+
+void beginTurn(int turnDirection) {
+  // turnDirection +1 = left, -1 = right.
+  beginCurvatureManeuver(turnCurvature(turnDirection));
+  // Schedule the auto-recenter for after enter-transition + hold.
+  // We deliberately do NOT add EXIT_TURN_TIME_S here: the recenter just
+  // *triggers* the exit transition, which then takes EXIT_TURN_TIME_S to
+  // complete on its own.
+  unsigned long holdMs =
+      (unsigned long)(ENTER_TURN_TIME_S * 1000.0f)
+    + (unsigned long)(TURN_HOLD_TIME_S * 1000.0f);
+  turnRecenterAtMs = millis() + holdMs;
+  if (turnRecenterAtMs == 0) {
+    // 0 is the "no pending recenter" sentinel; bump by 1ms to avoid it.
+    turnRecenterAtMs = 1;
   }
 }
 
@@ -466,10 +552,12 @@ int speedToPwm(float speedMps) {
 
 void emergencyStop() {
   driveState = DRIVE_STOPPED;
+  motionState = MOTION_STATIONARY;
   maneuverStartCurvature = 0.0f;
   maneuverTargetCurvature = 0.0f;
   maneuverTransitionTimeS = 0.0f;
   maneuverStartMs = millis();
+  turnRecenterAtMs = 0;
   stopMotors();
 }
 
