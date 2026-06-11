@@ -1,9 +1,24 @@
 /*
-  Rear UNO controller for the articulated four-wheel voice car.
+  Rear UNO controller for the 4-wheel skid-steer car.
 
-  This sketch is open-loop: it computes target wheel linear speeds from
-  geometry, then maps those speeds to PWM by a calibration table.
-  Fill the physical parameters and the speed-to-PWM table after the car is built.
+  Chassis model: rigid 4-wheel car, 4 fixed-direction wheels, no steering
+  linkage. Turning is achieved entirely by differential PWM between the
+  left and right sides ("skid steering" / "tank steering").
+
+  Wiring: this board drives the two REAR wheels (left + right).
+  The front board drives the two front wheels independently with the
+  same sketch (only BOARD_NAME and the per-wheel trim/direction values
+  differ).
+
+  Because the chassis is rigid and the front/rear axles are coaxial in
+  the body frame, the front-left and rear-left wheels should always be
+  commanded to the same speed, and likewise for the right side. So each
+  board runs the same kinematics on the same Bluetooth command stream
+  and the chassis stays coordinated — no inter-board sync needed, no
+  delay queue, no path offset.
+
+  See front_uno_controller.ino for the full behavior description; this
+  sketch is identical apart from BOARD_NAME and per-wheel trim values.
 */
 
 #include <Arduino.h>
@@ -20,42 +35,50 @@ const char BOARD_NAME[] = "REAR";
 // Physical parameters
 // =======================
 
-// Distance between left and right wheel contact centers on one UNO module.
+// Distance between left and right wheel contact centers.
 // Unit: meter (m)
-const float WHEEL_TRACK_M = 0.160f;
+const float WHEEL_TRACK_M = 0.105f;
 
-// Distance between front wheel axle center and rear wheel axle center.
+// Nominal path radius of the chassis center during a steady L/R turn.
+// At 0.05 m combined with MIN_INNER_SPEED_RATIO = -1, the inner wheel
+// actually reverses — i.e. close to an in-place spin. Increase toward
+// 0.10~0.15 for a wider arc, decrease toward 0.03 for an even sharper
+// spin.
 // Unit: meter (m)
-const float VEHICLE_LENGTH_M = 0.320f;
+const float TURN_RADIUS_M = 0.050f;
 
-// Distance offset of this wheel module along the planned vehicle path.
-// Front board: 0.0 m
-// Rear board: VEHICLE_LENGTH_M
-// Unit: meter (m)
-const float PATH_OFFSET_M = VEHICLE_LENGTH_M;
-
-// Desired path radius of the module center during steady turning.
-// Unit: meter (m)
-const float TURN_RADIUS_M = 0.800f;
-
-// Smooth transition time for entering a turn.
+// Smooth transition time for entering a turn. Kept short so the
+// differential bite shows up quickly.
 // Unit: second (s)
-const float ENTER_TURN_TIME_S = 1.200f;
+const float ENTER_TURN_TIME_S = 0.300f;
 
-// Smooth transition time for exiting a turn.
+// Smooth transition time for exiting a turn (returning to straight).
 // Unit: second (s)
-const float EXIT_TURN_TIME_S = 1.200f;
+const float EXIT_TURN_TIME_S = 0.300f;
+
+// How long L/R holds the target curvature after the entry transition
+// finishes, before auto-recentering. Split into left/right because the
+// chassis is open-loop and the two sides rarely produce equal yaw rates
+// — usually because of motor/trim asymmetry or uneven floor friction.
+// Tune: shrink the side that over-turns, grow the side that under-turns.
+// Unit: second (s)
+const float TURN_HOLD_TIME_LEFT_S  = 4.000f;
+const float TURN_HOLD_TIME_RIGHT_S = 3.000f;
 
 // Minimum inner-wheel speed ratio allowed during a turn.
-// Example: 0.60 means the inner wheel should not go below 60% of the outer wheel.
+//   +0.60  inner wheel must stay at >=60% of outer (gentle arc)
+//    0.00  inner wheel may stop entirely (sharp arc, outer-only push)
+//   -1.00  inner wheel may fully reverse at outer's speed (in-place spin)
+// The clamp inside clampTurnCurvature still leaves a tiny epsilon so
+// the denominator stays nonzero.
 // Unit: none
-const float MIN_INNER_SPEED_RATIO = 0.600f;
+const float MIN_INNER_SPEED_RATIO = -1.000f;
 
 // =======================
 // Open-loop speed settings
 // =======================
 
-// Available center speeds for this module.
+// Available chassis-center speeds.
 // Unit: meter per second (m/s)
 const float SPEED_LEVELS_MPS[] = {
   0.100f,
@@ -66,10 +89,6 @@ const float SPEED_LEVELS_MPS[] = {
 // Default speed level index in SPEED_LEVELS_MPS.
 // Unit: none
 const int DEFAULT_SPEED_LEVEL_INDEX = 1;
-
-// Minimum speed used when converting path offset to time delay.
-// Unit: meter per second (m/s)
-const float MIN_DELAY_SPEED_MPS = 0.050f;
 
 // =======================
 // Speed-to-PWM calibration table
@@ -99,17 +118,18 @@ const int PWM_TABLE[] = {
 
 // Largest PWM allowed during the first car tests.
 // Unit: Arduino analogWrite value, range 0-255
-const int PWM_MAX_SAFE = 170;
+const int PWM_MAX_SAFE = 230;
 
-// Per-wheel open-loop correction multipliers.
+// Per-wheel open-loop correction multipliers (compensate for motor
+// variation so the two sides actually run at the commanded speed).
 // Unit: none
-const float LEFT_WHEEL_TRIM = 1.000f;
-const float RIGHT_WHEEL_TRIM = 1.000f;
+const float LEFT_WHEEL_TRIM = 1.300f;
+const float RIGHT_WHEEL_TRIM = 0.930f;
 
-// Motor direction correction.
-// Use 1 for normal direction and -1 if the wheel runs backward.
+// Motor direction correction. Use 1 if the wheel turns the "right" way
+// when given forward PWM, -1 if it spins backward (wired in reverse).
 // Unit: none
-const int LEFT_MOTOR_DIR = 1;
+const int LEFT_MOTOR_DIR = -1;
 const int RIGHT_MOTOR_DIR = 1;
 
 // =======================
@@ -121,19 +141,15 @@ const int RIGHT_MOTOR_DIR = 1;
 const unsigned long BLUETOOTH_BAUD = 9600;
 
 // Left motor forward PWM pin.
-// Unit: Arduino pin number
 const int LEFT_FORWARD_PWM_PIN = 5;
 
 // Left motor reverse PWM pin.
-// Unit: Arduino pin number
 const int LEFT_REVERSE_PWM_PIN = 3;
 
 // Right motor forward PWM pin.
-// Unit: Arduino pin number
 const int RIGHT_FORWARD_PWM_PIN = 10;
 
 // Right motor reverse PWM pin.
-// Unit: Arduino pin number
 const int RIGHT_REVERSE_PWM_PIN = 9;
 
 // =======================
@@ -146,7 +162,12 @@ const unsigned long CONTROL_PERIOD_MS = 20;
 
 // Stop the car if no valid Bluetooth command is received in this time.
 // Unit: millisecond (ms)
-const unsigned long COMMAND_TIMEOUT_MS = 3000;
+const unsigned long COMMAND_TIMEOUT_MS = 20000;
+
+// Brief motor-off pause inserted when reversing F<->B, to protect the
+// H-bridge from a hard polarity flip while current is still flowing.
+// Unit: millisecond (ms)
+const unsigned long DIRECTION_REVERSAL_PAUSE_MS = 100;
 
 // =======================
 // Runtime state
@@ -157,7 +178,16 @@ enum DriveState {
   DRIVE_ACTIVE,
 };
 
+// High-level motion state. STATIONARY = car not moving (boot, or after
+// S). In STATIONARY only F/B/S are accepted; L/R/U/D are silently
+// ignored.
+enum MotionState {
+  MOTION_STATIONARY,
+  MOTION_MOVING,
+};
+
 DriveState driveState = DRIVE_STOPPED;
+MotionState motionState = MOTION_STATIONARY;
 int speedLevelIndex = DEFAULT_SPEED_LEVEL_INDEX;
 int driveDirection = 1;
 
@@ -169,24 +199,12 @@ unsigned long maneuverStartMs = 0;
 unsigned long lastCommandMs = 0;
 unsigned long lastControlMs = 0;
 
+// When the current turn (non-zero target curvature) should auto-recenter
+// to straight. 0 means "no pending auto-recenter".
+unsigned long turnRecenterAtMs = 0;
+
 const int SPEED_LEVEL_COUNT = sizeof(SPEED_LEVELS_MPS) / sizeof(SPEED_LEVELS_MPS[0]);
 const int SPEED_TABLE_COUNT = sizeof(SPEED_TABLE_MPS) / sizeof(SPEED_TABLE_MPS[0]);
-
-// =======================
-// Command queue
-// =======================
-
-struct QueuedCommand {
-  char code;
-  unsigned long arrivedMs;
-};
-
-const int CMD_QUEUE_SIZE = 8;
-QueuedCommand cmdQueue[CMD_QUEUE_SIZE];
-int queueHead = 0;
-int queueCount = 0;
-
-unsigned long pathDelayMs = 0;
 
 void setup() {
   pinMode(LEFT_FORWARD_PWM_PIN, OUTPUT);
@@ -201,15 +219,23 @@ void setup() {
   lastCommandMs = now;
   lastControlMs = now;
 
-  updatePathDelayMs();
   emergencyStop();
 }
 
 void loop() {
   readBluetoothCommands();
-  processQueue();
 
   const unsigned long now = millis();
+
+  // Auto-recenter: a previously-issued L/R has held its target curvature
+  // long enough; transition back to straight and clear the latch.
+  if (motionState == MOTION_MOVING
+      && turnRecenterAtMs != 0
+      && (long)(now - turnRecenterAtMs) >= 0) {
+    turnRecenterAtMs = 0;
+    beginCurvatureManeuver(0.0f);
+  }
+
   if (driveState == DRIVE_ACTIVE && now - lastCommandMs > COMMAND_TIMEOUT_MS) {
     emergencyStop();
   }
@@ -229,74 +255,35 @@ void readBluetoothCommands() {
     if (command >= 'a' && command <= 'z') {
       command = command - 'a' + 'A';
     }
-    lastCommandMs = millis();
-    if (command == 'S') {
-      queueCount = 0;
-      queueHead = 0;
-      emergencyStop();
-    } else {
-      enqueue(command, millis());
-    }
+    handleCommand(command);
   }
-}
-
-void enqueue(char code, unsigned long arrivedMs) {
-  if (queueCount >= CMD_QUEUE_SIZE) {
-    queueHead = (queueHead + 1) % CMD_QUEUE_SIZE;
-    queueCount -= 1;
-  }
-  int tail = (queueHead + queueCount) % CMD_QUEUE_SIZE;
-  cmdQueue[tail].code = code;
-  cmdQueue[tail].arrivedMs = arrivedMs;
-  queueCount += 1;
-}
-
-void processQueue() {
-  const unsigned long now = millis();
-  while (queueCount > 0) {
-    QueuedCommand& cmd = cmdQueue[queueHead];
-    if (now - cmd.arrivedMs < pathDelayMs) {
-      break;
-    }
-    handleCommand(cmd.code);
-    queueHead = (queueHead + 1) % CMD_QUEUE_SIZE;
-    queueCount -= 1;
-  }
-}
-
-void updatePathDelayMs() {
-  float speedMps = selectedSpeedMps();
-  if (speedMps < MIN_DELAY_SPEED_MPS) {
-    speedMps = MIN_DELAY_SPEED_MPS;
-  }
-  pathDelayMs = (unsigned long)(PATH_OFFSET_M / speedMps * 1000.0f);
 }
 
 void handleCommand(char command) {
+  // In STATIONARY, only F/B (start moving) and S (stay stopped) take
+  // effect. L/R/U/D silently ignored — the car never starts moving from
+  // a turn or speed-change command.
+  if (motionState == MOTION_STATIONARY
+      && command != 'F' && command != 'B' && command != 'S') {
+    return;
+  }
+
   switch (command) {
     case 'F':
       lastCommandMs = millis();
-      driveDirection = 1;
-      driveState = DRIVE_ACTIVE;
-      beginCurvatureManeuver(0.0f);
+      startOrUpdateDrive(+1);
       break;
     case 'B':
       lastCommandMs = millis();
-      driveDirection = -1;
-      driveState = DRIVE_ACTIVE;
-      beginCurvatureManeuver(0.0f);
+      startOrUpdateDrive(-1);
       break;
     case 'L':
       lastCommandMs = millis();
-      driveDirection = 1;
-      driveState = DRIVE_ACTIVE;
-      beginCurvatureManeuver(turnCurvature(+1));
+      beginTurn(+1);
       break;
     case 'R':
       lastCommandMs = millis();
-      driveDirection = 1;
-      driveState = DRIVE_ACTIVE;
-      beginCurvatureManeuver(turnCurvature(-1));
+      beginTurn(-1);
       break;
     case 'S':
       lastCommandMs = millis();
@@ -312,6 +299,45 @@ void handleCommand(char command) {
       break;
     default:
       break;
+  }
+}
+
+void startOrUpdateDrive(int newDirection) {
+  // F<->B reversal protection: if we're already moving in the opposite
+  // direction, stop the motors for a short pause before flipping. This
+  // prevents the H-bridge from seeing a hard polarity flip while
+  // current is still flowing through the motor windings.
+  if (motionState == MOTION_MOVING && newDirection != driveDirection) {
+    stopMotors();
+    delay(DIRECTION_REVERSAL_PAUSE_MS);
+  }
+  driveDirection = newDirection;
+  driveState = DRIVE_ACTIVE;
+  motionState = MOTION_MOVING;
+  // Starting (or re-asserting) straight motion cancels any pending turn.
+  turnRecenterAtMs = 0;
+  beginCurvatureManeuver(0.0f);
+}
+
+void beginTurn(int turnDirection) {
+  // turnDirection +1 = left, -1 = right.
+  beginCurvatureManeuver(turnCurvature(turnDirection));
+  // Pick the hold time for this side. Splitting L/R lets you compensate
+  // when one direction over-turns relative to the other.
+  const float holdTimeS = (turnDirection >= 0)
+      ? TURN_HOLD_TIME_LEFT_S
+      : TURN_HOLD_TIME_RIGHT_S;
+  // Schedule the auto-recenter for after enter-transition + hold.
+  // We deliberately do NOT add EXIT_TURN_TIME_S here: the recenter just
+  // *triggers* the exit transition, which then takes EXIT_TURN_TIME_S
+  // to complete on its own.
+  unsigned long holdMs =
+      (unsigned long)(ENTER_TURN_TIME_S * 1000.0f)
+    + (unsigned long)(holdTimeS * 1000.0f);
+  turnRecenterAtMs = millis() + holdMs;
+  if (turnRecenterAtMs == 0) {
+    // 0 is the "no pending recenter" sentinel; bump by 1ms to avoid it.
+    turnRecenterAtMs = 1;
   }
 }
 
@@ -384,9 +410,12 @@ float clampTurnCurvature(float curvature) {
     return 0.0f;
   }
 
+  // Allow ratio to go negative (inner wheel reverses for in-place spin).
+  // Lower bound -0.95 keeps the denominator (1 + ratio) safely away from
+  // zero; the resulting maxAbsCurvature is already enormous.
   float ratio = MIN_INNER_SPEED_RATIO;
-  if (ratio < 0.0f) {
-    ratio = 0.0f;
+  if (ratio < -0.95f) {
+    ratio = -0.95f;
   }
   if (ratio > 0.95f) {
     ratio = 0.95f;
@@ -413,6 +442,10 @@ void updateWheelOutputs(unsigned long nowMs) {
   const float centerSpeedMps = driveDirection * selectedSpeedMps();
   const float curvature = plannedCurvatureAt(nowMs);
 
+  // Differential drive (skid-steer) split:
+  //   v_left  = v_center * (1 - track/2 * curvature)
+  //   v_right = v_center * (1 + track/2 * curvature)
+  // Positive curvature = left turn (right wheel faster than left).
   const float leftWheelSpeedMps =
       centerSpeedMps * (1.0f - 0.5f * WHEEL_TRACK_M * curvature);
   const float rightWheelSpeedMps =
@@ -446,14 +479,12 @@ float selectedSpeedMps() {
 void increaseSpeedLevel() {
   if (speedLevelIndex < SPEED_LEVEL_COUNT - 1) {
     speedLevelIndex += 1;
-    updatePathDelayMs();
   }
 }
 
 void decreaseSpeedLevel() {
   if (speedLevelIndex > 0) {
     speedLevelIndex -= 1;
-    updatePathDelayMs();
   }
 }
 
@@ -516,10 +547,12 @@ int speedToPwm(float speedMps) {
 
 void emergencyStop() {
   driveState = DRIVE_STOPPED;
+  motionState = MOTION_STATIONARY;
   maneuverStartCurvature = 0.0f;
   maneuverTargetCurvature = 0.0f;
   maneuverTransitionTimeS = 0.0f;
   maneuverStartMs = millis();
+  turnRecenterAtMs = 0;
   stopMotors();
 }
 

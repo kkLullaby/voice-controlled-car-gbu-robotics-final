@@ -9,6 +9,28 @@
   -> 蓝牙串口广播到 Arduino 板
 ```
 
+## ⚠️ 当前电控代码（2026-06 更新）
+
+**整车实际烧的是 `Examples/front_uno_controller/` 和 `Examples/rear_uno_controller/`**，
+不是 `car_bluetooth_drive.ino`。后者是早期单板/桌面调试用的极简 sketch，
+仍保留作为蓝牙链路验证工具，但**整车演示用 front + rear 双板方案**。
+
+两者关键差异：
+
+| 方面 | `car_bluetooth_drive.ino` | `front_uno_controller` + `rear_uno_controller` |
+|---|---|---|
+| 用途 | 单板桌面调试、链路烟测 | 整车真机演示 |
+| L/R 转向 | 内侧轮停 + 外侧轮转（原地旋转） | 平滑弧线转向（挂车几何） |
+| 自动回正 | 无（持续转弯） | **L/R 转向后 1.5s 自动回正继续直行**（TURN_HOLD_TIME_S）|
+| rear 板延迟 | 无 | **运动中收到 L/R 时延迟 `VEHICLE_LENGTH_M / speed` 秒**（模拟挂车轴距）；F/B/U/D/S 无延迟 |
+| 启动同步 | — | **静止→运动时前后板同时启动 F/B**（不入队） |
+| 状态机 | 无 | **STATIONARY/MOVING 两态**：静止时只响应 F/B/S，忽略 L/R/U/D |
+| F↔B 反向 | 立即反转 | **先 stopMotors 100ms** 再反向（保护 H 桥）|
+| 超时停车 | 1 秒 | **20 秒**（持续运动测试用） |
+| 速度档 | PWM 固定表 | 实测速度 m/s + PWM 校准表（需实测填回宏值） |
+
+⚠️ **20 秒超时意味着蓝牙断开后车会跑约 20 秒才自动停**。调试时必须备好快速发 `S` 的窗口，或者电池总开关在手。
+
 ## Current Status
 
 **PC 端 + 蓝牙链路 + Arduino 接收/电机 sketch 已经全部跑通**。剩下的是物理安装电机+电池+车轮后的真车调试，详见 `docs/hardware_bringup.md`。
@@ -228,9 +250,11 @@ tools/
   emergency_stop.sh      连发 S 给所有 /dev/rfcomm*，紧急停车用
 
 Examples/
-  bt_echo_debug.ino           Arduino 调试 sketch，回显蓝牙收到的字节
-  car_bluetooth_drive.ino     **生产 sketch**：F/B/L/R/S/U/D 电机控制 + 1s 超时自动停
-  sketchcar_may19a.ino        旧避障参考 sketch
+  bt_echo_debug.ino                       Arduino 调试 sketch，回显蓝牙收到的字节
+  car_bluetooth_drive.ino                 早期单板调试 sketch（原地转、1s 超时）。整车演示**不用这个**
+  front_uno_controller/front_uno_controller.ino  **整车前板生产 sketch**：弧线转向 + 状态机 + 20s 超时
+  rear_uno_controller/rear_uno_controller.ino    **整车后板生产 sketch**：同上 + L/R 命令延迟（挂车几何）
+  sketchcar_may19a.ino                    旧避障参考 sketch
 
 tests/
   test_*.py              unittest 用例
